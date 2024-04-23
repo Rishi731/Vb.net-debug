@@ -1,0 +1,1414 @@
+Imports System
+Imports StayinFront.Workflow
+Imports StayinFront.Engine
+Imports Microsoft.VisualBasic.Interaction
+Imports Microsoft.VisualBasic
+
+Public Class VBDotNetScript
+	Private Shared objSystemLog
+	Private Shared MergeType
+	Private Shared objDBProvider
+	Private Shared objDB
+	Private Shared objCmd
+	Private Shared objRecordSet
+	Private Shared objcon
+	Private Shared sys As Model
+
+	Public Shared Sub Execute(model As Model, pendingWork As WF_PendingWork, propertiesIn As WorkflowPropertyCollection, propertiesOut As WorkflowPropertyCollection, progress As WorkflowProgressUI)
+		sys = model
+		objSystemLog = Nothing
+		objSystemLog = model.LG_LogJobStarted("Organization Type Merge Interface")
+		objcon = ConnectDB()
+		Try
+			If Not objcon Is Nothing Then
+				MergeOrganizations(objcon)
+			End If	
+		Catch ex As exception
+		objSystemLog.InvokeMethod("LogNormalDetail", ex.Message)
+		Finally
+		objSystemLog.InvokeMethod("LogJobComplete", "Completed")
+		objSystemLog = Nothing
+		objDBProvider = Nothing
+		objDB = Nothing
+		objCmd = Nothing
+		End Try
+	End Sub
+
+	Private Shared Sub MergeOrganizations(objcon)
+		Logmessage("MergeOrganizations start")
+		Dim strdescription As String = ""
+		Dim lngCount As Long
+		Dim lngRejectCount As Long
+		Dim lngDoneCount As Long
+		Dim lngDoneCountNew As Long
+
+		Dim dtmLast As Date
+		Dim strErrors() As String
+		Dim strFrom As String
+		Dim strInto As String
+		Dim strFromClass As String
+		Dim strTmpFromClass As String
+		Dim strIntoClass As String
+		Dim strIntoFolder As String
+		Dim strMailingAddressPostCode As String
+		Dim strCallAddressPostCode As String
+		Dim strClassOfTradeGeneral As String
+		Dim strClassOfTradeDetail As String
+
+		lngCount = 0
+		lngRejectCount = 0
+		lngDoneCount = 0
+		lngDoneCountNew = 0 'JSP counter for new Org Type
+		Dim oFromInst
+		Dim oToInst
+		Dim oClassOfTradeGeneral
+		Dim objImportProcess
+		Dim objImportProcessConfig
+		Dim bIsError As Boolean
+		Dim objAETrans
+		
+
+		'used for DCH_ChangeReason
+		Dim objUser
+		Dim strSQL As String
+		Dim bToOrgCreatedNew As Boolean
+		Dim strDeleteDays As String
+		Dim nDeleteDays As Integer
+		'On Error GoTo ErrHandler
+		Try
+			objUser = Nothing
+			objUser = sys.User.Object
+			objUser.properties("DCH_ChangeReason").value = "Organization Type Change Interface"
+
+			strSQL = ""
+			strSQL = "select * from dbo.sysobjects where name = 'OM_OrgFromTo'"
+			objRecordSet = GetSPDataSet2(objcon, strSQL) '
+			'Set objRecordSet = sys.CreateRecordset(strConnString,strSql)  
+			
+			If Not objRecordSet Is Nothing Then
+				lngCount = objRecordSet.RecordCount
+				If (lngCount = 0) Then
+					objSystemLog.InvokeMethod("LogNormalDetail"," Table OM_OrgFromTo does not exist.")
+					objSystemLog.InvokeMethod("LogNormalDetail","Type Change Cancelled")
+				Else
+					'for cleaning up in cases where after move, records were orphaned due to new synch 
+					strSQL = ""
+					strSQL = strSQL & "select  O.Organization, OM.FromOrganization, OM.ToOrganization, O.Name , O.AddressMailingAddressPostcode , O.AddressCallAddressPostCode, A.Class as FromClass, CTD.Description as ToClass, CTG.Description, CTG.ClassOfTradeGeneral, CTD.ClassOfTradeDetail " 'JSP added GUIDs for ClassOfTradeGeneral, ClassOfTradeDetail
+					strSQL = strSQL & " from organization O  (nolock) "
+					strSQL = strSQL & " join classoftradegeneral CTG (nolock) on CTG.Classoftradegeneral = O.classoftradegeneral  "
+					strSQL = strSQL & " join ClassOfTradeDetail CTD (nolock) on CTD.ClassOfTradeDetail = O.ClassOfTradeDetail  "
+					strSQL = strSQL & " join AS_Assignee A (nolock) on A.AS_Assignee = O.Organization  "
+					strSQL = strSQL & " left join OM_OrgFromTo OM (nolock) on OM.FromOrganization = O.Organization "
+					strSQL = strSQL & " where CTG.Description= 'Change Organization Type'"
+					
+					objRecordSet.Close
+					objRecordSet = Nothing
+					objRecordSet = GetSPDataSet2(objcon, strSQL) '
+					If Not objRecordSet Is Nothing Then
+						lngCount = objRecordSet.RecordCount
+						' Only process when there are records to be processed
+						If (lngCount = 0) Then
+							objSystemLog.InvokeMethod("LogNormalDetail",lngCount & " records identified for processing.")
+							objSystemLog.InvokeMethod("LogNormalDetail","Type Change Completed")
+						End If
+					End If
+				End If
+			End If
+
+			dtmLast = Now()
+
+
+			' there are records to process
+			objSystemLog.InvokeMethod("LogNormalDetail",lngCount & " records identified for processing.")
+			' --------------------------------------
+			' ---------- CREATE/UPDATE SUMMARY TABLE
+			' --------------------------------------
+			If lngCount > 0 Then
+			' Only process when there are records to be processed
+				Do While Not objRecordSet.EOF
+				'For Each dr In ds.Tables(0).Rows
+					Redim strErrors(0)
+					bIsError = False
+					objAETrans = sys.BeginTransaction
+					'strFrom = dr("Organization").ToString 'guid
+					strFrom = objRecordset.Fields("Organization").Value.ToString()
+					'strFromClass = Trim(dr("FromClass").ToString) ' AS_Assignee.class
+					strFromClass = objRecordset.Fields("FromClass").Value.ToString()
+					'JSP 20100823 Dev. 936 - Assignee.Class
+					strTmpFromClass = Ucase(strFromClass)
+					If strTmpFromClass = "HEALTHSYSTEM" Then
+						strTmpFromClass = "HEALTH SYSTEM"
+					ElseIf strTmpFromClass = "OTHERORGANIZATION" Then
+						strTmpFromClass = "OTHER ORGANIZATION"
+					ElseIf strTmpFromClass = "MM_PAYER" Then
+						strTmpFromClass = "PAYER"
+					End If
+					'strInto = dr("ToOrganization").ToString 'guid will be created new if value is null
+					strInto = objRecordset.Fields("ToOrganization").Value.ToString()
+					strIntoClass = Ucase(objRecordset.Fields("ToClass").Value.ToString())
+					strMailingAddressPostCode = objRecordset.Fields("AddressMailingAddressPostcode").Value.ToString()
+					strCallAddressPostCode = objRecordset.Fields("AddressCallAddressPostCode").Value.ToString()
+					'JSP 20101221 - Dev. 1747 added ClassOfTradeGeneral, ClassOfTradeDetail
+					strClassOfTradeGeneral = objRecordset.Fields("ClassOfTradeGeneral").Value.ToString()
+					strClassOfTradeDetail = objRecordset.Fields("ClassOfTradeDetail").Value.ToString()
+					strdescription = "FROM: " & strFrom & " FromClass: " & strFromClass & " IntoClass: " & strIntoClass
+						
+					'Get the instance of both From and To
+					oFromInst = Nothing
+					oToInst = Nothing
+					'set to True if ToOrg was created
+					bToOrgCreatedNew = False
+					
+					'JSP - 20101221 - check for a wrong assigned ClassOfTradeDetail 
+					oClassOfTradeGeneral = Nothing
+					oClassOfTradeGeneral = sys.Classes("ClassOfTradeGeneral").GetInstance(strClassOfTradeGeneral)
+					If Not oClassOfTradeGeneral Is Nothing Then
+						If oClassOfTradeGeneral.Folders("ClassofTradeDetail").Scan("key = '" & strClassOfTradeDetail & "'").EndOfScan Then
+						'ClassOfTradeDetail does not belong to this ClassOfTradeGeneral log message
+							objSystemLog.InvokeMethod("LogWarningDetail","INSTANCE_WARNING: Source= Wrong Class of Trade Detail with key " & strClassOfTradeDetail & " " & strFrom)
+							bIsError = True
+							lngRejectCount = lngRejectCount + 1
+						End If
+					Else
+					'ClassOfTradeGeneral not found
+						objSystemLog.InvokeMethod("LogWarningDetail","INSTANCE_WARNING: Source= Class of Trade General not found with key " & strClassOfTradeGeneral & " " & strFrom)
+						bIsError = True
+						lngRejectCount = lngRejectCount + 1
+					End If
+					'JSP 20110725 Dev. 2708 - skip the records if Postcode field is blank
+					If Len(Trim(strMailingAddressPostCode)) = 0 Or Len(Trim(strCallAddressPostCode)) = 0 Then
+						Redim Preserve strErrors(Ubound(strErrors) + 1)
+						strErrors(Ubound(strErrors)) = " from Org has CHANGE_SIF post code, record must exists in off-model"
+						objSystemLog.InvokeMethod("LogWarningDetail","INSTANCE_WARNING: Source=" & strFrom & "- from Org has CHANGE_SIF post code, record must exist in off-model..")
+						bIsError = True 'JSP 20110824 - skip the record
+						lngRejectCount = lngRejectCount + 1
+					End If
+					If Not bIsError Then
+						If Len(Trim(strFrom)) = 0 Then
+							Redim Preserve strErrors(Ubound(strErrors) + 1)
+							strErrors(Ubound(strErrors)) = "FROM GUID not found."
+							objSystemLog.InvokeMethod("LogWarningDetail","INSTANCE_WARNING: Source=" & strFrom & "- FROM GUID not found..")
+							lngRejectCount = lngRejectCount + 1
+						Else
+							oFromInst = sys.Classes(Trim(strFromClass)).GetInstance(strFrom)
+						End If
+						
+						If Len(Trim(strIntoClass)) = 0 Then
+							Redim Preserve strErrors(Ubound(strErrors) + 1)
+							strErrors(Ubound(strErrors)) = "IN TO CLASS not found."
+							objSystemLog.InvokeMethod("LogWarningDetail","INSTANCE_WARNING: Source=" & strdescription & "- INTO CLASS not found..")
+							lngRejectCount = lngRejectCount + 1
+						ElseIf strTmpFromClass = strIntoClass Then ''JSP 20110725 Dev. 2096
+							'clear out Class of Trade General and Class of Trade Detail
+							If Not oFromInst Is Nothing Then 'JSP 20110726 Dev. 2101 - check if oFromInst is nothing
+								CType(oFromInst.Members("ClassOfTradeGeneral"), JoinMember).Value = Nothing
+								CType(oFromInst.Members("ClassOfTradeDetail"), JoinMember).Value = Nothing
+								oFromInst.Save(objAETrans)
+								
+								If objAETrans.Validate.Status <> 3 Then
+									objAETrans.Commit()
+								End If
+							End If
+							
+							Redim Preserve strErrors(Ubound(strErrors) + 1)
+							strErrors(Ubound(strErrors)) = " changing to the same Organization type."
+							objSystemLog.InvokeMethod("LogWarningDetail","INSTANCE_WARNING: Source=" & strdescription & "- changing to the same Organization type..")
+							lngRejectCount = lngRejectCount + 1
+							
+						ElseIf (Ucase(strMailingAddressPostCode) = "CHANGE_SIF" Or Ucase(strCallAddressPostCode) = "CHANGE_SIF") And Len(Trim(strInto)) = 0 Then
+							Redim Preserve strErrors(Ubound(strErrors) + 1)
+							strErrors(Ubound(strErrors)) = " from Org has CHANGE_SIF post code, record must exists in off-model"
+							objSystemLog.InvokeMethod("LogWarningDetail","INSTANCE_WARNING: Source=" & strdescription & "- from Org has CHANGE_SIF post code, record must exists in off-model..")
+							lngRejectCount = lngRejectCount + 1
+						Else
+							If strIntoClass = "HEALTH SYSTEM" Then
+								strIntoFolder = "HEALTHSYSTEM"
+							ElseIf strIntoClass = "HOSPITAL" Then
+								strIntoFolder = "HOSPITALS"
+							ElseIf strIntoClass = "OTHER ORGANIZATION" Then
+								strIntoFolder = "OTHERORGANIZATIONS"
+							ElseIf strIntoClass = "PAYER" Then
+								strIntoFolder = "MM_PAYER"
+							ElseIf strIntoClass = "PHARMACY" Then
+								strIntoFolder = "PHARMACIES"
+							ElseIf strIntoClass = "PRACTICE" Then
+								strIntoFolder = "PRACTICES"
+							Else
+							'output must be a TLF folder            (GPO, WHOLESALER) 
+								strIntoFolder = strIntoClass
+							End If
+							'check if this has already been created in off-model table 
+							If Len(Trim(strInto)) = 0 Then
+								oToInst = sys.Folders(strIntoFolder).CreateNewInstance 'create the correct organization type
+								'orgType = sys.Classes("OrganizationType").GetInstance(strIntoFolder)
+								Dim objtype1
+								For Each objtype1 In sys.folders("OrganizationType").Scan()
+									If Instr(Ucase(objtype1.Members("OrganizationClass").Value.Value.ToString()),Ucase(Replace(strIntoClass," ",""))) > 0 Then
+										oToInst.Members("OrganizationType").Value = objtype1
+										Exit For
+									End If 
+								Next	
+								'orgType = sys.folders("OrganizationType").First("OrganizationClass.Members.Value.Display = 'GPO'")
+								'oToInst.Members("OrganizationType") = orgType
+								strInto = oToInst.Key.ToString()
+								bToOrgCreatedNew = True
+							Else
+								'get the ToInstance, it was added/processed before
+								'JSP - 20100914 - a possibility that this can be deleted 
+								If Not sys.Folders(strIntoFolder).Scan("key = '" & strInto & "'", "Name", 1, "").EndOfScan Then
+									oToInst = sys.Folders(strIntoFolder).Scan("key = '" & strInto & "'", "Name", "1","").Fetch
+								Else
+								'log the error
+									strdescription = " key = '" & strInto
+								End If
+							End If
+							If Not (oFromInst Is Nothing And oToInst Is Nothing) Then
+								If bToOrgCreatedNew Then _
+								AssignOrgMembers(oToInst, oFromInst, objAETrans)
+								If MergeAffiliations(oToInst, oFromInst, objAETrans, "FromOrganization") Then
+									objSystemLog.InvokeMethod("LogWarningDetail","INSTANCE_WARNING: Source=" & strdescription & "- Organization Merge was skipped due to Affiliation issue ")
+									lngRejectCount = lngRejectCount + 1
+									Goto lblSkipToNext
+								End If
+								MergeProfiles(oToInst, oFromInst, objAETrans, "ORGANIZATION")
+								MergeCalls(oToInst, oFromInst, objAETrans, "ORGANIZATION")
+								MergeContacts(oToInst, oFromInst, objAETrans, "ORGANIZATION")
+								MergeTerritories(oToInst, oFromInst, objAETrans, "Assignee")
+								LogMessage("SubMergeGeneric function start --1 ")
+								SubMergeGeneric(oToInst, oFromInst, objAETrans, "Organization", "StructuredNotes")
+								MergeOtherKnownID(oToInst, oFromInst, objAETrans, "Organization")
+								LogMessage("SubMergeGeneric function start --2 ")
+								SubMergeGeneric(oToInst, oFromInst, objAETrans, "ParentAccount", "ChildAccounts")
+								LogMessage("SubMergeGeneric function start --3 ")
+								SubMergeGeneric(oToInst, oFromInst, objAETrans, "Organization", "ChangeAddresses")
+								LogMessage("SubMergeGeneric function start --4 ")
+								SubMergeGeneric(oToInst, oFromInst, objAETrans, "TargetOrganization", "Me_Presenteds")
+								LogMessage("SubMergeGeneric function start --5 ")
+								SubMergeGeneric(oToInst, oFromInst, objAETrans, "OrganizationJoin", "Org_ExpenseLines")
+								'OK to use Generic fxn.  Merge uses a custom one to check for dups
+								LogMessage("SubMergeGeneric function start --6 ")
+								SubMergeGeneric(oToInst, oFromInst, objAETrans, "Organization", "OrganizationSpecialties")
+								LogMessage("SubMergeGeneric function start --7 ")
+								SubMergeGeneric(oToInst, oFromInst, objAETrans, "Organization", "PA_NextCallObjectives")
+								LogMessage("SubMergeGeneric function start --8 ")
+								SubMergeGeneric(oToInst, oFromInst, objAETrans, "Organization", "PayerOpportunities")
+								LogMessage("SubMergeGeneric function start --9 ")
+								SubMergeGeneric(oToInst, oFromInst, objAETrans, "Organization", "TaskActivities")
+								'Dev#4393 APN 3/30/2012 Rekey org on prescriber sales.
+								MergePrescriberSales(oToInst, oFromInst, objAETrans)
+								LogMessage("SubMergeGeneric function start --10 ")
+								SubMergeGeneric(oToInst, oFromInst, objAETrans, "Organization", "SaSalesOrganizations")
+								LogMessage("SubMergeGeneric function start --11 ")
+								SubMergeGeneric(oToInst, oFromInst, objAETrans, "Organization", "GPOOrganizations")
+								LogMessage("SubMergeGeneric function start --12 ")
+								SubMergeGeneric(oToInst, oFromInst, objAETrans, "Organization", "HealthSystemOrganizations")
+								LogMessage("SubMergeGeneric function start --13 ")
+								SubMergeGeneric(oToInst, oFromInst, objAETrans, "AppliesOrgTarget", "PP_Applies")
+								LogMessage("SubMergeGeneric function start --14 ")
+								SubMergeGeneric(oToInst, oFromInst, objAETrans, "Organization", "PM_Projects")
+								LogMessage("SubMergeGeneric function start --15 ")
+								SubMergeGeneric(oToInst, oFromInst, objAETrans, "Target", "PA_OrgTarget")
+								LogMessage("SubMergeGeneric function start --16 ")
+								SubMergeGeneric(oToInst, oFromInst, objAETrans, "Organization", "WholeSalerOrganizations")
+								LogMessage("SubMergeGeneric function start --17 ")
+								SubMergeGeneric(oToInst, oFromInst, objAETrans, "AS_Assignee", "UserAssignees")
+								' LogMessage("MergePA_OrgTarget function start --0 ")
+								MergePA_OrgTarget(oToInst, oFromInst, objAETrans, "Target")
+								LogMessage("SubMergeGeneric function start --18 ")
+								SubMergeGeneric(oToInst, oFromInst, objAETrans, "Organization", "surveyResponses")
+								LogMessage("SubMergeContract function start --19 ")
+								SubMergeContract(oToInst, oFromInst, objAETrans, "Organization", "Contracts")
+								
+								LogMessage("SubMergeGeneric function start --20 ")
+								SubMergeGeneric(oToInst, oFromInst, objAETrans, "Organization", "Documents")
+								LogMessage("SubMergeGeneric function start --21 ")
+								SubMergeGeneric(oToInst, oFromInst, objAETrans, "KPI_Source", "KPIs")
+								LogMessage("SubMergeGeneric function start --22 ")
+								SubMergeGeneric(oToInst, oFromInst, objAETrans, "Organization", "surveyResponses")
+								'KDomadiya 20121207
+								'Ypatel Defetct # 4926
+								'KDomadiya 20121210 Defect #4926
+								LogMessage("SubMergeGeneric function start --23 ")
+								SubMergeGeneric(oToInst, oFromInst, objAETrans, "Organization", "TouchPresentationInstances")
+								LogMessage("SubMergeGeneric function start --24 ")
+								SubMergeGeneric(oToInst, oFromInst, objAETrans, "Hospital", "ProcedureStatistics")
+								Select Case Ucase(strFromClass)
+								Case "HOSPITAL"
+									MergeKeyAccountPlan(oToInst, oFromInst, objAETrans, strFromClass, strIntoClass, "PP_HospitalKeyAccountPlans") 'KeyAccountPlan - pass the folder 
+									
+								Case "HEALTHSYSTEM"
+									MergeKeyAccountPlan(oToInst, oFromInst, objAETrans, strFromClass, strIntoClass, "PP_HealthSystemKeyAccountPlans")
+									MergeGPOs(oToInst, oFromInst, objAETrans, "Organization")
+									
+								Case "PHARMACY"
+									MergeKeyAccountPlan(oToInst, oFromInst, objAETrans, strFromClass, strIntoClass, "PP_KeyAccountPlans") 'KeyAccountPlan - pass the folder 
+									
+								Case "MM_PAYER"
+									MergeKeyAccountPlan(oToInst, oFromInst, objAETrans, "PAYER", strIntoClass, "PayerBusinessPlans") 'KeyAccountPlan - pass the folder 
+									
+								Case "WHOLESALER"
+									MergeKeyAccountPlan(oToInst, oFromInst, objAETrans, strFromClass, strIntoClass, "PP_KeyAccountPlans") 'KeyAccountPlan - pass the folder 
+									MergeWholesaler(oToInst, oFromInst, objAETrans, "Organization") 'Accounts
+									SubMergeGeneric(oToInst, oFromInst, objAETrans, "Organization", "WholeSalerOrganizations") 'WholeSalerOrganization
+									
+								Case "PRACTICE"
+									MergeKeyAccountPlan(oToInst, oFromInst, objAETrans, strFromClass, strIntoClass, "PP_KeyAccountPlans") 'KeyAccountPlan - pass the folder 
+									
+								Case "GPO"
+									MergeKeyAccountPlan(oToInst, oFromInst, objAETrans, strFromClass, strIntoClass, "PP_KeyAccountPlans") 'KeyAccountPlan - pass the folder 
+									MergeGPOs(oToInst, oFromInst, objAETrans, "Organization")
+									
+								Case "OTHERORGANIZATION"
+									MergeKeyAccountPlan(oToInst, oFromInst, objAETrans, strFromClass, strIntoClass, "PP_KeyAccountPlans") 'KeyAccountPlan - pass the folder 
+								End Select
+								'PK 11032015 - To merge 
+								SubMergeGeneric(oToInst, oFromInst, objAETrans, "Assignee", "AssigneeHTMLReports")
+								'If there is no Dynamic members in the To entity then copy the Dynamic Mebers
+								If oToInst.Folders("Organization_DM_Ext_Folder").Count = 0 Then
+									SubMergeGeneric(oToInst, oFromInst, objAETrans, "Organization", "Organization_DM_Ext_Folder")
+								End If
+								If oToInst.Folders("Organization_DM_Ext2_Folder").Count = 0 Then
+									SubMergeGeneric(oToInst, oFromInst, objAETrans, "Organization", "Organization_DM_Ext2_Folder")
+								End If
+								If oToInst.Folders("Organization_DM_Ext3_Folder").Count = 0 Then
+									SubMergeGeneric(oToInst, oFromInst, objAETrans, "Organization", "Organization_DM_Ext3_Folder")
+								End If
+								If ProcessTransaction(objAETrans, strErrors, "Organization", strdescription) Then
+									objAETrans = sys.BeginTransaction
+									oFromInst.Members("clientno").Value = "" '"" 'will be set to blank
+									If Not IsNullNothing(oFromInst.Members("Address")) Then
+										If Not IsNullNothing(oFromInst.Members("Address").Value.Members("CallAddress")) Then
+											If (Not IsNullNothing(oFromInst.Members("Address").Value.Members("CallAddress").Value.Members("Postcode"))) Then _
+											oFromInst.Members("Address").Value.Members("CallAddress").Value.Members("Postcode").Value = "CHANGE_SIF"
+										End If
+										If Not IsNullNothing(oFromInst.Members("Address").Value.Members("MailingAddress")) Then
+											If (Not IsNullNothing(oFromInst.Members("Address").Value.Members("MailingAddress").Value.Members("Postcode"))) Then _
+											oFromInst.Members("Address").Value.Members("MailingAddress").Value.Members("Postcode").Value = "CHANGE_SIF"
+										End If
+									End If
+									If Not IsNullNothing(oFromInst.Members("VendorAddress")) Then
+										If (Not IsNullNothing(oFromInst.Members("VendorAddress").Value.Members("Postcode"))) Then _
+										oFromInst.Members("VendorAddress").Value.Members("Postcode").Value = "CHANGE_SIF"
+									End If
+									'changing from hospital- set Hospital ID to blank
+									If oFromInst.IsKindOf("Hospital") Then _
+										oFromInst.Members("HospitalID").Value = ""
+									'append to notes to save the ToOrganization guid
+									If bToOrgCreatedNew Then
+										 If objUser.Members("Role").value.Members("EnableNotesOnOrganizations").Value.ToString() Then
+											oFromInst.Members("Notes").value = "" & oFromInst.Members("Notes").value & " " & "New Org: [" & strInto & "]"
+										 End If
+										lngDoneCountNew = lngDoneCountNew + 1 'count the number of added Org 
+										objSystemLog.InvokeMethod("LogNormalDetail","New Organization created " & strdescription)
+									Else
+										lngDoneCount = lngDoneCount + 1
+									End If
+									oFromInst.Save(objAETrans)
+									If objAETrans.Validate.Status <> 3 Then
+										objAETrans.Commit()
+										'Insert into the off-model table so it wont be processed again
+										'Insert only if it was created new
+										If bToOrgCreatedNew Then
+											strSQL = ""
+											strSQL = strSQL & "INSERT INTO [OM_OrgFromTo] ([FromOrganization] ,[FromClass], [ToOrganization] ,[ToClass] ,[date_created]) "
+											strSQL = strSQL & "VALUES ('" & strFrom & "', '" & strFromClass & "', '" & strInto & "', '" & strIntoClass & "' ,getdate())"
+											CreateCommand(strSQL, objCon)
+										End If
+									Else
+										objSystemLog.InvokeMethod("LogWarningDetail","INSTANCE_WARNING: Source=" & strdescription & "- Type Change completed, but the FROM instance is not saved.")
+									End If
+									'PK - 11022016 - Added code to update the DQHistory MergeHistory
+									Dim objDQMergeHistory
+									objDQMergeHistory = Nothing
+									objDQMergeHistory = sys.Folders("DQMergeHistory").CreateNewInstance()
+									If Not objDQMergeHistory Is Nothing Then
+										objAETrans = sys.BeginTransaction
+										objDQMergeHistory.Members("ClassName").Value = strIntoClass
+										objDQMergeHistory.Members("MergeDate").Value = Now()
+										objDQMergeHistory.Members("MergeFrom").Value = New GUID(strFrom)
+										objDQMergeHistory.Members("MergeTo").Value = New GUID(strInto)
+										objDQMergeHistory.Save(objAETrans)
+										If ProcessTransaction(objAETrans, strErrors, "Organization", strdescription) Then
+										Else
+											Dim jj As Integer
+											Dim strTempError As String
+											
+											strTempError = ""
+											For jj = 1 To Ubound(strErrors)
+												strTempError = strTempError & ", " & strErrors(jj)
+											Next												
+											Dim strErrorString = ParseForSQL("INSTANCE_WARNING: Source=" & strdescription & "- Merged, But Failed to Update DQ Merge History Class. " & strTempError)
+											objSystemLog.InvokeMethod("LogErrorDetail","","",strErrorString)
+										End If
+									End If
+								Else
+									' Merge Rejected Record
+									lngRejectCount = lngRejectCount + 1
+									'JSP 20091202 - add the logging of errors here
+									
+									Dim jj As Integer
+									Dim strTempError As String
+									
+									strTempError = ""
+									For jj = 1 To Ubound(strErrors)
+										strTempError = strTempError & ", " & strErrors(jj)
+									Next
+									objSystemLog.InvokeMethod("LogWarningDetail","INSTANCE_WARNING: Source=" & strdescription & "- Failed to Change Type " & strTempError)
+								End If
+								'End If   ' IsKindOf check
+							Else
+								If (oFromInst Is Nothing) Then
+									objSystemLog.InvokeMethod("LogWarningDetail","INSTANCE_WARNING: Source=" & strDescription & "- From Instance returned is nothing..")
+									lngRejectCount = lngRejectCount + 1
+								End If
+								If (oToInst Is Nothing) Then
+									objSystemLog.InvokeMethod("LogWarningDetail","INSTANCE_WARNING: Source=" & strDescription & "- To Instance returned is nothing..")
+									lngRejectCount = lngRejectCount + 1
+								End If
+							End If ' check for FromInstance and To Instance	
+						End If
+					End If
+					'JSP 20110727 - Dev. 2098 - check if this can be deleted by getting settings from 
+					'Import process 
+					objImportProcess = Nothing
+					nDeleteDays = 0 'initial value
+					If Not sys.Folders("ImportProcess").Scan("ProgramKey = 'ORGSWITCH'", "ProgramKey", 1).EndOfScan Then _
+						objImportProcess = sys.Folders("ImportProcess").Scan("ProgramKey = 'ORGSWITCH'", "ProgramKey", 1).Fetch
+					If Not objImportProcess Is Nothing Then
+						'get setting of "Delete old orgs more than x old days and Active
+						objImportProcessConfig = Nothing
+						If Not objImportProcess.Folders("ImportProcessConfigurations").Scan("ConfigValue = 'Delete old orgs more than x days old' and Active=True", "ConfigAction", 1).EndOfScan Then _
+						objImportProcessConfig = objImportProcess.Folders("ImportProcessConfigurations").Scan("ConfigValue = 'Delete old orgs more than x days old'", "ConfigAction", 1).Fetch
+						If Not objImportProcessConfig Is Nothing Then
+							strDeleteDays = Trim(objImportProcessConfig.Members("ConfigAction").value)
+							If Len(strDeleteDays) > 0 Then
+								If IsNumeric(strDeleteDays) Then
+									nDeleteDays = Convert.ToInt32(strDeleteDays)
+								End If
+							End If
+						End If
+					End If
+					'APN 20120328 - Do not delete if there is an error.
+					'check also for the existence of strFrom and strInto
+					If Len(strFrom) > 0 And Len(strInto) > 0 And Not bIsError Then
+						If Not oFromInst Is Nothing Then
+							'Compare against latest WhenUpdate if more that what was set
+							'Change the condition as per Adam's suggestion(Related Defect #5887).
+							If DateDiff("d", oFromInst.Members("RecordStamp").Value.Members("WhenUpdate").value, Now()) >= nDeleteDays Then
+								'PK - 12082015 - Fix for Dev# 7981 - PE_Calls subfolder doesnot exists for organization
+								'If Not oFromInst.PE_Calls.Exists Then ' oFromInst.DeleteStatus = 0 Then
+								If oFromInst.CanDelete And oFromInst.DeleteStatus = 0 Then
+									objAETrans = sys.BeginTransaction
+									oFromInst.Delete(objAETrans)
+									If ProcessTransaction(objAETrans, strErrors, "Organization", strdescription) Then
+										objSystemLog.InvokeMethod("LogNormalDetail","Successfully deleted organization " & strdescription)
+										'Mark merge with "S" success - an indicator for the Orphan control that parent has morphed to another 
+										strFrom = GetGUID(strFrom) 'get rid of "{ or }
+										strInto = GetGUID(strInto)
+									End If
+								End If
+							End If
+						End If
+					End If
+					lblSkipToNext:
+					objRecordSet.MoveNext
+				Loop
+				objRecordSet.Close
+				objRecordSet = Nothing
+				'Next
+				objSystemLog.InvokeMethod("LogNormalDetail","PROCESS DETAIL:  " & (lngRejectCount + lngDoneCount + lngDoneCountNew) & " of " & lngCount & " Records Processed.  (" & lngRejectCount & " rejected, " & lngDoneCount & " re-keyed, " & lngDoneCountNew & " new org(s) added)")
+				'KDomadiya 20130402 Defect #6038
+				strSQL = "select name, o.* from OM_OrgFromTo o (nolock) join Organization c (nolock) on o.FromOrganization  = c.Organization where DateDiff(d, date_created, GETDATE()) >= " & nDeleteDays & " order by date_created desc"
+				objRecordSet = GetSPDataSet2(objcon, strSQL) '
+				If Not objRecordSet Is Nothing Then
+					lngCount = objRecordSet.RecordCount
+				' Only process when there are records to be processed
+				End If
+				Dim lngDeleteCount As Long
+				lngDeleteCount = 0
+				Dim oDeleteInst
+				If lngCount > 0 Then
+				' Only process when there are records to be processed
+					'For Each dr In ds.Tables(0).Rows
+					Do While Not objRecordSet.EOF
+						Redim strErrors(0)
+						objAETrans = sys.BeginTransaction
+						'strFrom = dr("FromOrganization").ToString 'guid   
+						strFrom = objRecordset.Fields("FromOrganization").Value.ToString()
+						If Not sys.Folders("Organizations").Scan("key = '" & strFrom & "'").EndOfScan Then
+							oDeleteInst = sys.Folders("Organizations").Scan("key = '" & strFrom & "'").Fetch
+							If oDeleteInst.CanDelete And oDeleteInst.DeleteStatus = 0 Then
+								strdescription = oDeleteInst.Prompt.ToString()
+								oDeleteInst.Delete(objAETrans)
+								lngDeleteCount = lngDeleteCount + 1
+							Else
+								objSystemLog.InvokeMethod("LogNormalDetail","Unable to delete Organization: " & oDeleteInst.Prompt.ToString() & ", Because of Deletion rules of Organization.")						
+							End If
+							If ProcessTransaction(objAETrans, strErrors, "Organization", strdescription) Then
+								objSystemLog.InvokeMethod("LogNormalDetail","Successfully deleted Organization " & strdescription)						
+							End If
+						End If
+						objRecordSet.MoveNext
+					Loop
+					'Next
+					objSystemLog.InvokeMethod("LogNormalDetail","PROCESS DETAIL:  " & (lngDeleteCount) & " of " & lngCount & " Records Deleted.")
+				Else
+					objSystemLog.InvokeMethod("LogNormalDetail","PROCESS DETAIL:  No Organization Records to Delete.")
+				End If		
+			End If
+			'objSystemLog.InvokeMethod("LogNormalDetail","Change Type Completed " & objI.IntDesc & " Type Change completed")
+			objSystemLog.InvokeMethod("LogNormalDetail","Change Type Completed")
+			
+			'reset
+			objUser.properties("DCH_ChangeReason").value = ""
+			objUser = Nothing
+		Catch ex As Exception
+			objSystemLog.InvokeMethod("LogErrorDetail","","","SYSTEM_ERROR:  Error " & Err.Number & ": " & _
+                Err.Description & " Record: " & strdescription & " Source=" & Err.Source)
+            objSystemLog.InvokeMethod("LogErrorDetail","","","SYSTEM_ERROR: Unable to Complete Type Change, process Cancelled")
+        End Try	
+		objAETrans = Nothing
+		Logmessage("MergeOrganizations finished")
+	End Sub
+
+	Shared Private Sub MergeContacts(ByVal pToInst As Object, ByVal pFromInst As Object, ByVal pTrans As Object, ByVal pClsName As String)
+		LogMessage("MergeContacts Function Start")
+		If pFromInst.Folders("Locations").count > 0 Then
+			Dim objLoc
+			'Check for duplicates
+			For Each objLoc In pFromInst.Folders("Locations").Scan("", pClsName)
+				If Not (IsNullNothing(objLoc.Members("Contact"))) Then
+					'JSP 20100908 dont check for duplicates it will done in Location Merge
+					'If Not pToInst.Folders("Locations").Exists("Contact = '" & objLoc.Contact.Key & "'") Then
+					objLoc.Members(pClsName).Value = pToInst
+					'if Hospital make it null value 
+					If pFromInst.IsKindOf("Hospital") And Not IsNullNothing(objLoc.Members("Hospital")) Then _
+					CType(objLoc.Members("Hospital"), JoinMember).Value = Nothing
+					
+					objLoc.Save(pTrans)
+					'Else will be done in cascading delete
+					'objLoc.Delete(pTrans)
+				End If
+				'End If
+			Next
+		End If
+		LogMessage("MergeContacts Function Finished.")
+	End Sub
+
+	Shared Private Sub MergeKeyAccountPlan(ByVal pToInst As Object, ByVal pFromInst As Object, ByVal pTrans As Object, ByVal pClsName As String, ByVal pstrIntoClass As String, ByVal strFolder As String)
+		LogMessage("MergeKeyAccountPlan function start")
+		Dim pToInstFolder As String
+		Select Case pstrIntoClass
+		Case "HOSPITAL"
+			pToInstFolder = "PP_HospitalKeyAccountPlans"
+		Case "PAYER"
+			pToInstFolder = "PayerBusinessPlans"
+		Case Else
+		' "GPO", "HEALTH SYSTEM", "OTHER ORGANIZATION", "PHARMACY", "PRACTICE", "WHOLESALER"
+			pToInstFolder = "PP_KeyAccountPlans"
+		End Select
+
+		If pFromInst.Folders(strFolder).Count > 0 Then
+			Dim objKeyAccountPlan
+			'Dim objTmpKeyAccountPlan 
+			Dim oNewKeyAccountPlan
+			For Each objKeyAccountPlan In pFromInst.Folders(strFolder).Scan("", pClsName, , "RecordStamp.WhenAdd ASC")
+				'recreate the KeyAccountPlan
+				'JSP 20100917 Dev. 937
+				'check if this has been deleted within the loop - subfolders might have been reprocessed due to
+				'same Organization
+				If objKeyAccountPlan.DeleteStatus = 0 Then
+					If objKeyAccountPlan.Properties.Exists("KAP Processed") Then
+					'its already been processed
+					Else
+						oNewKeyAccountPlan = Nothing
+						'Main KAP Plan - it has to be recreated
+						oNewKeyAccountPlan = pToInst.Folders(pToInstFolder).CreateNewInstance
+						
+						If Not oNewKeyAccountPlan Is Nothing Then
+							'JSP 20100914 done in model	
+							If Not IsNullNothing(objKeyAccountPlan.Members("HomeOffice")) Then _
+								oNewKeyAccountPlan.Members("HomeOffice").value = objKeyAccountPlan.Members("HomeOffice").value
+							
+							If Not IsNullNothing(objKeyAccountPlan.Members("Product")) Then _
+								oNewKeyAccountPlan.Members("Product").value = objKeyAccountPlan.Members("Product").value
+							
+							If Not IsNullNothing(objKeyAccountPlan.Members("Team")) Then _
+								oNewKeyAccountPlan.Members("Team").value = objKeyAccountPlan.Members("Team").value
+							
+							If Not IsNullNothing(objKeyAccountPlan.Members("Territory")) Then _
+								oNewKeyAccountPlan.Members("Territory").value = objKeyAccountPlan.Members("Territory").value
+							
+							If Not IsNullNothing(objKeyAccountPlan.Members("Title").value) Then _
+								oNewKeyAccountPlan.Members("Title").value = objKeyAccountPlan.Members("Title").value
+							
+							If Not IsNullNothing(objKeyAccountPlan.Members("Validity")) Then
+								If Not IsNullNothing(objKeyAccountPlan.Members("Validity").Value.Members("start").value) Then _
+									oNewKeyAccountPlan.Members("Validity").Value.Members("start").value = objKeyAccountPlan.Members("Validity").Value.Members("start").value
+								If Not IsNullNothing(objKeyAccountPlan.Members("Validity").Value.Members("finish").value) Then _
+									oNewKeyAccountPlan.Members("Validity").Members("finish").value = objKeyAccountPlan.Members("Validity").Value.Members("finish").value
+							End If
+							If Not IsNullNothing(objKeyAccountPlan.Members("PP_SWOT")) Then
+								CType(oNewKeyAccountPlan.Members("PP_SWOT"), ClassMember).Value.Copy(CType(objKeyAccountPlan.Members("PP_SWOT"), ClassMember).Value)
+							End If
+							
+							'parent plan
+							If Not IsNullNothing(objKeyAccountPlan.Members("ParentPlan")) Then _
+							oNewKeyAccountPlan.Members("ParentPlan").value = objKeyAccountPlan.Members("ParentPlan").value
+							
+							oNewKeyAccountPlan.Save(pTrans)
+						End If
+						
+						'sub-folders 
+						MergeSingleSalesObjective(oNewKeyAccountPlan, objKeyAccountPlan, pTrans, "PP_KEYACCOUNTPLAN", "PP_SingleSalesObjectives")
+						SubMergeGeneric(oNewKeyAccountPlan, objKeyAccountPlan, pTrans, "PP_PLAN", "PP_Activities") 'PP_Activity
+						SubMergeGeneric(oNewKeyAccountPlan, objKeyAccountPlan, pTrans, "PP_PLAN", "PP_Competitors") 'PP_Competitor
+						SubMergeGeneric(oNewKeyAccountPlan, objKeyAccountPlan, pTrans, "PP_PLAN", "PP_Influencers") 'PP_Influencer
+						SubMergeGeneric(oNewKeyAccountPlan, objKeyAccountPlan, pTrans, "PP_PLAN", "PP_PlanAttachments") 'PP_PlanAttachment
+						SubMergeGeneric(oNewKeyAccountPlan, objKeyAccountPlan, pTrans, "PP_PLAN", "PP_PlanReviews") 'PP_PlanReview
+						'SubMergeGeneric(oNewKeyAccountPlan, objKeyAccountPlan, pTrans, "PP_KEYACCOUNTPLAN", "PP_Applies") 'PP_Apply
+						MergePP_Apply(oNewKeyAccountPlan, objKeyAccountPlan, pTrans, "PP_KEYACCOUNTPLAN", "PP_Applies") 'PP_Apply
+						'SubMergeGeneric(oNewKeyAccountPlan, objKeyAccountPlan, pTrans, "ParentPlan", "PP_KeyAccountPlans") 'PP_KeyAccountPlan
+						'delete old plan
+						'Deleting the old plan populates the ChildPlans.ParentPlan to null
+						If objKeyAccountPlan.CanDelete And objKeyAccountPlan.DeleteStatus = 0 Then
+							objKeyAccountPlan.Delete(pTrans)
+						End If
+						'Call after old Main Key Account Plan was deleted
+						MergeKeyAccountPlanChildren(oNewKeyAccountPlan, objKeyAccountPlan, pTrans, "ParentPlan", "PP_KeyAccountPlans", pToInst, oNewKeyAccountPlan.Class.Name)
+						
+					End If
+				End If
+			Next
+		End If
+		LogMessage("MergeKeyAccountPlan function finished")
+	End Sub
+
+	Shared Private Function MergeAffiliations(ByVal pToInst As Object, ByVal pFromInst As Object, ByVal pTrans As Object, ByVal pClsName As String) As Boolean
+		LogMessage("MergeAffiliations Function Start")
+		Dim bDontSave As Boolean : bDontSave = False
+
+		If pFromInst.Folders("Affiliations").count > 0 Then
+			Dim objAff
+			Dim objAffiliation
+			Dim bDupFound As Boolean
+			'Check for duplicates
+			For Each objAff In pFromInst.Folders("Affiliations").Scan("", pClsName)
+				'JSP 20100826 test if this is for parent or childrelationship - 
+				'JSP 20100902 copied from OrgTypeChange Dev. 925 added EnabledDelete 
+				'JSP 20100907 Dev. 1043removed EnableDelete
+				If (objAff.Members("Relationship").Value.Members("isChildRelationship").value Or objAff.Members("Relationship").Value.Members("isParentRelationship").value) Then
+				'JSP 20100826 test if this is for parent or childrelationship 
+				'skip the record
+				Else
+					'JSP 20100907 Dev. 1043 check for bad records - will be deleted in cascading
+					'Relationship is required
+					'JSP -20100913 - Dev. 1052, 1066
+					If Not IsNullNothing(objAff.Members("Relationship")) Then
+						'Reverse relationship is also required
+						If Not IsNullNothing(objAff.Members("Relationship").Value.Members("Reverse")) Then
+							'check also if the old affiliation can be deleted - taken from the model 
+							Dim strFilter As String
+							
+							
+							strFilter = "key <> '" & objAff.Key.ToString() & "' and AffiliationId = '" & objAff.Members("AffiliationId").value & "'"
+							bDontSave = False
+							If Not objAff.Members("ToOrganization").OldValue Is Nothing Then
+								For Each objAffiliation In objAff.Members("ToOrganization").oldvalue.folders("Affiliations").Scan(strFilter)
+									If Not objAffiliation.CanDelete Then
+										bDontSave = True
+										objSystemLog.InvokeMethod("LogNormalDetail","LogNormalDetail","Affiliation with guid [" & objAffiliation.Key.ToString() & "] can not be deleted from Organization with guid [" & objAff.Members("ToOrganization").Value.key.ToString() & "]")
+										'Exit For
+									End If
+								Next
+							End If
+							
+							If Not objAff.Members("ToDepartment").OldValue Is Nothing Then
+								For Each objAffiliation In objAff.Members("ToDepartment").OldValue.Folders("Affiliations").Scan(strFilter)
+									If Not objAffiliation.CanDelete Then
+										bDontSave = True
+										objSystemLog.InvokeMethod("LogWarningDetail","Affiliation with guid [" & objAffiliation.Key.ToString() & "] can not be deleted from Department with guid [" & objAff.Members("ToDepartment").Value.key.ToString() & "]")
+										'Exit For
+									End If
+								Next
+							End If
+							
+							If Not objAff.Members("ToContact").OldValue Is Nothing Then
+								For Each objAffiliation In objAff.Members("ToContact").OldValue.Folders("Affiliations").Scan(strFilter)
+									If Not objAffiliation.CanDelete Then
+										'a problem in moving the affiliation
+										bDontSave = True
+										objSystemLog.InvokeMethod("LogWarningDetail","Affiliation with guid [" & objAffiliation.Key.ToString() & "] can not be deleted from Contact with guid [" & objAff.Members("ToContact").Value.key.ToString() & "]")
+										'Exit For
+									End If
+								Next
+							End If
+							If Not bDontSave Then
+								'JSP 20101006 check for duplicates
+								bDupFound = False
+								 If Not IsNullNothing(objAff.Members("ToContact")) Then
+									'ToContact
+									If pToInst.Folders("Affiliations").ExistsWhere("ToContact.Key = '" & objAff.Members("ToContact").Value.Key.ToString() & "'") Then
+										bDupFound = True
+									End If
+									
+								 ElseIf Not IsNullNothing(objAff.Members("ToDepartment")) Then
+									'ToDepartment
+									If pToInst.Folders("Affiliations").ExistsWhere("ToDepartment.Key = '" & objAff.Members("ToDepartment").Value.Key.ToString() & "'") Then
+										bDupFound = True
+									End If
+									
+								ElseIf Not IsNullNothing(objAff.Members("ToOrganization")) Then
+									'ToOrganization
+									If pToInst.Folders("Affiliations").ExistsWhere("ToOrganization.Key = '" & objAff.Members("ToOrganization").Value.Key.ToString() & "'") Then
+										bDupFound = True
+									End If
+								End If
+								If Not bDupFound Then
+									objAff.Members(pClsName).Value = pToInst
+									objAff.Save(pTrans)
+									'else Delete - will be Deleted by cascading delete
+								End If
+							End If
+						End If
+						
+					End If
+				End If
+			Next
+		End If
+		MergeAffiliations = bDontSave
+		LogMessage("MergeAffiliations function finished.")
+	End Function
+
+	Shared Private Sub MergeCalls(ByVal pToInst As Object, ByVal pFromInst As Object, ByVal pTrans As Object, ByVal pClsName As String)
+		LogMessage("MergeCalls function start")
+		If pFromInst.Folders("Activities").count > 0 Then
+			Dim objCalls
+			'Copy all calls 
+			For Each objCalls In pFromInst.Folders("Activities").Scan("", pClsName)
+				objCalls.Members(pClsName).Value = pToInst
+				'if Hospital to Other type of Org, Hospital link must be null
+				If pFromInst.IsKindOf("Hospital") And Not IsNullNothing(objCalls.Members("Hospital")) Then _
+					CType(objCalls.Members("Hospital"), JoinMember).Value = Nothing
+					objCalls.Save(pTrans)
+			Next
+		End If
+		LogMessage("MergeCalls function finished")
+	End Sub
+
+	Shared Private Sub MergeProfiles(ByVal pToInst As Object, ByVal pFromInst As Object, ByVal pTrans As Object, ByVal pClsName As String)
+		LogMessage("MergeProfiles Function Start")
+		If pFromInst.Folders("OrganizationProfiles").count > 0 Then
+			Dim objProfiles
+			'Check for duplicates
+			For Each objProfiles In pFromInst.Folders("OrganizationProfiles").Scan("", "ProfileCategory")
+				If (Not IsNullNothing(objProfiles.Members("ProfileCategory"))) And (Not IsNullNothing(objProfiles.Members("ProfileValue"))) Then
+					If Not pToInst.Folders("OrganizationProfiles").ExistsWhere("ProfileCategory.Key = '" & objProfiles.Members("ProfileCategory").Value.Key.ToString() & "' and ProfileValue.Key = '" & objProfiles.Members("ProfileValue").Value.Key.ToString() & "'") Then
+						'If Not pToInst.Folders("OrganizationProfiles").Exists("ProfileCategory = '" & objProfiles.ProfileCategory.Key & "'") Then
+						objProfiles.Members(pClsName).Value = pToInst
+						objProfiles.Save(pTrans)
+						'Else
+						'objProfiles.Delete(pTrans)
+					End If
+				End If
+			Next
+		End If
+		LogMessage("MergeProfiles Function Finished")
+	End Sub
+
+	Shared Private Sub MergeTerritories(ByVal pToInst As Object, ByVal pFromInst As Object, ByVal pTrans As Object, ByVal pClsName As String)
+		LogMessage("MergeTerritories function start")
+		If pFromInst.Folders("Territories").count > 0 Then
+			Dim objTerr
+			'Check for duplicates
+			For Each objTerr In pFromInst.Folders("Territories").Scan("", pClsName)
+				If (Not IsNullNothing(objTerr.Members("Territory"))) Then
+					If Not pToInst.Folders("Territories").ExistsWhere("Territory = '" & objTerr.Members("Territory").Value.Key.ToString() & "'") Then
+						objTerr.Members(pClsName).Value = pToInst
+						objTerr.Save(pTrans)
+					End If
+				End If
+			Next
+		End If
+		LogMessage("MergeTerritories function finished")
+	End Sub
+
+	Shared Private Sub MergeOtherKnownID(ByVal pToInst As Object, ByVal pFromInst As Object, ByVal pTrans As Object, ByVal pClsName As String)
+		LogMessage("MergeOtherKnownID function start")
+		If pFromInst.Folders("Org_Other_KnownIDs").count > 0 Then
+			Dim objOtherKnownID
+			'JSP 20101007 Check for duplicates - Same Type and Value
+			For Each objOtherKnownID In pFromInst.Folders("Org_Other_KnownIDs").Scan("", pClsName)
+				If Not (IsNullNothing(objOtherKnownID.Members("RendOtherIDType"))) And Not IsNullNothing(objOtherKnownID.Members("ID")) Then
+					If Not pToInst.Folders("Org_Other_KnownIDs").ExistsWhere("RendOtherIDType.Key = '" & objOtherKnownID.Members("RendOtherIDType").Value.Key.ToString() & "' and ID = '" & objOtherKnownID.Members("ID").value & "'") Then
+						objOtherKnownID.Members(pClsName).Value = pToInst
+						objOtherKnownID.Save(pTrans)
+					ElseIf objOtherKnownID.CanDelete And objOtherKnownID.DeleteStatus = 0 Then
+						'set at Leave children at the model - explicit Delete here
+						objOtherKnownID.Delete(pTrans)
+					End If
+				End If
+			Next
+		End If
+		LogMessage("MergeOtherKnownID function finished")
+	End Sub
+
+	Shared Private Sub AssignOrgMembers(ByVal pToInst As Object, ByVal pFromInst As Object, ByVal pTrans As Object)
+		LogMessage("AssignOrgMembers function start")
+		'AssigneeName
+		If IsNullNothing(pToInst.Members("AssigneeName").Value) And (Not IsNullNothing(pFromInst.Members("AssigneeName").Value)) Then _
+			pToInst.Members("AssigneeName").Value = pFromInst.Members("AssigneeName").Value
+		'Name
+		
+		If IsNullNothing(pToInst.Members("Name")) And (Not IsNullNothing(pFromInst.Members("Name"))) Then
+			pToInst.Members("Name").Value = pFromInst.Members("Name").Value.ToString()
+        End If
+		'Phone
+		Dim strToPhone As DataMember
+		Dim strFromPhone As DataMember
+		strToPhone = pToInst.Members("Phone").Value.Members("Number")
+		strFromPhone = pFromInst.Members("Phone").Value.Members("Number")
+		If IsNullNothing(strToPhone) And (Not IsNullNothing(strFromPhone)) Then
+			CType(pToInst.Members("Phone"), ClassMember).Value.Copy(CType(pFromInst.Members("Phone"), ClassMember).Value)
+		End If
+
+		'Fax - Check the number and copy all the details. 
+		Dim strToFax As DataMember
+		Dim strFromFax As DataMember
+		strToFax = pToInst.Members("Fax").Value.Members("Number")
+		strFromFax = pFromInst.Members("Fax").Value.Members("Number")
+		If IsNullNothing(strToFax) And (Not IsNullNothing(strFromFax)) Then
+			CType(pToInst.Members("Fax"), ClassMember).Value.Copy(CType(pFromInst.Members("Fax"), ClassMember).Value)
+		End If
+
+		'WWW
+		Dim strToWWW As DataMember
+		Dim strFromWWW As DataMember
+		strToWWW = pToInst.Members("WWW").Value.Members("wwwAddress")
+		strFromWWW = pFromInst.Members("WWW").Value.Members("wwwAddress")
+		If IsNullNothing(strToWWW) And (Not IsNullNothing(strFromWWW)) Then
+			CType(pToInst.Members("WWW"), ClassMember).Value.Copy(CType(pFromInst.Members("WWW"), ClassMember).Value)
+		End If
+		
+		'CallAddress
+		If Not IsNullNothing(pToInst.Members("Address")) Then
+			If Not IsNullNothing(pToInst.Members("Address").Value.Members("CallAddress")) And (Not IsNullNothing(pFromInst.Members("Address").Value.Members("CallAddress"))) Then
+				CType(CType(pToInst.Members("Address"), ClassMember).Value.Members("CallAddress"), ClassMember).Value.Copy(CType(CType(pFromInst.Members("Address"), ClassMember).Value.Members("CallAddress"), ClassMember).Value)
+			End If
+		End If
+		'MailingAddress
+		If Not IsNullNothing(pToInst.Members("Address")) Then
+			If Not IsNullNothing(pToInst.Members("Address").Value.Members("MailingAddress")) And (Not IsNullNothing(pFromInst.Members("Address").Value.Members("MailingAddress"))) Then
+				CType(CType(pToInst.Members("Address"), ClassMember).Value.Members("MailingAddress"), ClassMember).Value.Copy(CType(CType(pFromInst.Members("Address"), ClassMember).Value.Members("MailingAddress"), ClassMember).Value)
+			End If
+		End If
+
+		If IsNullNothing(pToInst.Members("DefaultCurrency")) And Not IsNullNothing(pFromInst.Members("DefaultCurrency")) Then _
+				pToInst.Members("DefaultCurrency").Value = pFromInst.Members("DefaultCurrency").Value
+		
+		'Territory
+		If IsNullNothing(pToInst.Members("Territory")) And Not IsNullNothing(pFromInst.Members("Territory")) Then _
+				pToInst.Members("Territory").Value = pFromInst.Members("Territory").Value
+
+		'Notes - Append merge data to master
+		If (IsNullNothing(pToInst.Members("Notes"))) And (Not IsNullNothing(pFromInst.Members("Notes"))) Then
+			pToInst.Members("Notes").Value = pFromInst.Members("Notes").Value
+		ElseIf (Not IsNullNothing(pFromInst.Members("Notes"))) Then
+			pToInst.Members("Notes").Value = pToInst.Members("Notes").value & vbCrLf & pFromInst.Members("Notes").Value
+		End If
+
+		'InkNotes
+		If IsNullNothing(pToInst.Members("InkNotes")) And (Not IsNullNothing(pFromInst.Members("InkNotes"))) Then _
+			pToInst.Members("InkNotes").Value = pFromInst.Members("InkNotes").Value
+		'ParentAccount
+		If IsNullNothing(pToInst.Members("ParentAccount")) And Not IsNullNothing(pFromInst.Members("ParentAccount")) Then
+			pToInst.Members("ParentAccount").Value = pFromInst.Members("ParentAccount").Value
+			'JSP 20100826 dev. 925 set ParentAccount to null 
+			CType(pFromInst.Members("ParentAccount"), JoinMember).Value = Nothing
+		End If
+
+		'PrimeSpecialty
+		If IsNullNothing(pToInst.Members("PrimeSpecialty")) And Not IsNullNothing(pFromInst.Members("PrimeSpecialty")) Then _
+			pToInst.Members("PrimeSpecialty").Value = pFromInst.Members("PrimeSpecialty").Value
+
+		'Formulary
+		If IsNullNothing(pToInst.Members("Formulary")) And Not IsNullNothing(pFromInst.Members("Formulary")) Then _
+			pToInst.Members("Formulary").Value = pFromInst.Members("Formulary").Value
+		'PrimeTerritory - JSP 20110726 Dev. 2902
+		If IsNullNothing(pToInst.Members("PrimeTerritory")) And (Not IsNullNothing(pFromInst.Members("PrimeTerritory"))) Then
+			pToInst.Members("PrimeTerritory").Value = pFromInst.Members("PrimeTerritory").Value
+		'JSP 20110729 -Dev. 2901 - blank it off 
+			CType(pFromInst.Members("PrimeTerritory"), JoinMember).Value = Nothing
+		End If
+		'ClientNo
+		If IsNullNothing(pToInst.Members("ClientNo")) And Not IsNullNothing(pFromInst.Members("ClientNo")) Then _
+			pToInst.Members("ClientNo").Value = pFromInst.Members("ClientNo").Value
+		'Ter1
+		If IsNullNothing(pToInst.Members("Ter1")) And Not IsNullNothing(pFromInst.Members("Ter1")) Then _
+			pToInst.Members("Ter1").Value = pFromInst.Members("Ter1").Value
+		'VendorAddress
+		If Not IsNullNothing(pToInst.Members("VendorAddress")) Then
+			If Not IsNullNothing(pFromInst.Members("VendorAddress")) Then
+				CType(pToInst.Members("VendorAddress"), ClassMember).Value.Copy(CType(pFromInst.Members("VendorAddress"), ClassMember).Value)
+			End If
+		End If
+		'OrgID
+		If (IsNullNothing(pToInst.Members("Org_ID"))) And (Not IsNullNothing(pFromInst.Members("Org_ID"))) Then _
+			pToInst.Members("Org_ID").Value = pFromInst.Members("Org_ID").Value
+
+		'VendorName
+		If (IsNullNothing(pToInst.Members("VendorName"))) And (Not IsNullNothing(pFromInst.Members("VendorName"))) Then _
+			pToInst.Members("VendorName").Value = pFromInst.Members("VendorName").Value
+
+		'added this for payer- required fields
+		If pToInst.IsKindOf("MM_Payer") Then
+			Dim objFS
+			objFS = Nothing
+			'accounttype
+			If pToInst.Members("AccountType").Value Then
+				'get from MM_PayerType picklist - sort by IsDefault then Desciption
+				objFS = sys.Folders("PayerTypes").Scan("","",1,"IsDefault DESC; Description ASC")
+				If Not objFS.EndOfScan Then _
+				pToInst.Members("AccountType").Value = objFS.Fetch
+			End If
+			objFS = Nothing
+			'SalesTeam
+			If IsNullNothing(pToInst.Members("SalesTeam")) Then
+				'get from MM_PayerType picklist
+				objFS = sys.Folders("Teams").Scan("","",1,"TeamName ASC")
+				If Not objFS.EndOfScan Then _
+				pToInst.Members("SalesTeam").Value = objFS.Fetch
+			End If
+		End If
+		pToInst.Save(pTrans)
+		LogMessage("AssignOrgMembers function finished.")
+	End Sub
+
+	Shared Private Function GetSPDataSet2(ByVal objcon As Object, ByVal strSQL As String)
+		Try
+			objRecordSet = CreateObject("ADODB.Recordset")
+			objcon.CommandTimeOut = 900
+			objRecordSet.ActiveConnection = objcon 
+			objRecordSet.Source = strSQL
+			objRecordSet.CursorType = 3
+			
+			objRecordSet.CacheSize = 100000
+			objRecordSet.LockType = 3  
+			objRecordSet.Open
+			GetSPDataSet2 = objRecordSet
+		Catch ex As Exception
+			Throw New Exception("Error occurred while accessing stored procedure:" & ex.Message)
+		End Try
+	End Function
+
+	Shared Private Sub CreateCommand(ByVal queryString As String, ByVal ObjCon As Object)
+		 Dim objCommand
+		objCommand = CreateObject("ADODB.command")
+		If Not objCommand Is Nothing Then
+			
+			objCommand.CommandText  = queryString
+			ObjCon.Execute(queryString)
+			
+		End If
+	End Sub
+
+
+	Shared Private Sub MergeGPOs(ByVal pToInst As Object, ByVal pFromInst As Object, ByVal pTrans As Object, ByVal pClsName As String)
+		If pFromInst.Folders("Members").count > 0 Then
+			Dim oInstOrganization
+			Dim oMember
+			Dim oMemberOrg
+			oInstOrganization = Nothing
+			oMemberOrg = Nothing
+			For Each oMember In pFromInst.Folders("Members").Scan("", pClsName) 'Organization
+				If Not IsNullNothing(oMember.Members("Organization")) Then
+					'check if pTOInst is HealthSystem or GPO - only these 2 types has "Members" sub folder
+					oMemberOrg = Nothing
+					If pToInst.IsKindOf("HealthSystem") Or pToInst.IsKindOf("GPO") Then
+						'Recreate in HealthSystem/GPO
+						oMemberOrg = pToInst.Folders("Members").CreateNewInstance
+					ElseIf pToInst.IsKindOf("Wholesaler") Then
+						'Recreate in WholeSaler
+						oMemberOrg = pToInst.Folders("Accounts").CreateNewInstance
+					End If
+					If Not oMemberOrg Is Nothing Then
+						'assign the old organization
+						oInstOrganization = Nothing
+						oInstOrganization = sys.Classes("Organization").GetInstance(oMember.Members("organization").key.ToString())
+						If Not oInstOrganization Is Nothing Then
+							oMemberOrg.Members(pClsName).value = oInstOrganization
+							oMemberOrg.Save(pTrans)
+						End If
+					End If
+					
+					'then Delete from GPO/HS
+					If oMember.CanDelete Or oMember.DeleteStatus = 0 Then
+						oMember.Delete(pTrans)
+					End If	
+				End If
+			Next
+		End If
+	End Sub
+
+	Shared Private Sub MergeWholesaler(ByVal pToInst As Object, ByVal pFromInst As Object, ByVal pTrans As Object, ByVal pClsName As String)
+		If pFromInst.Folders("Accounts").count > 0 Then
+			Dim oInstOrganization
+			Dim oMember
+			Dim oMemberOrg
+			oInstOrganization = Nothing
+			oMemberOrg = Nothing
+			For Each oMember In pFromInst.Folders("Accounts").Scan("", pClsName) 'Organization
+				If Not IsNullNothing(oMember.Members("Organization")) Then
+					'check if pTOInst is HealthSystem or GPO - only these 2 types has "Members" sub folder
+					oMemberOrg = Nothing
+					If pToInst.IsKindOf("HealthSystem") Or pToInst.IsKindOf("GPO") Then
+						'Recreate in HealthSystem/GPO
+						oMemberOrg = pToInst.Folders("Members").CreateNewInstance
+					End If
+					If Not oMemberOrg Is Nothing Then
+						'assign the old organization
+						oInstOrganization = Nothing
+						oInstOrganization = sys.Classes("Organization").GetInstance(oMember.Members("organization").key.ToString())
+						If Not oInstOrganization Is Nothing Then
+							oMemberOrg.Members(pClsName).value = oInstOrganization
+							oMemberOrg.Save(pTrans)
+						End If
+					End If
+					
+					'then Delete from Wholesaler
+					oMember.Delete(pTrans)
+				End If
+			Next
+		End If
+	End Sub
+
+	Shared Private Sub SubMergeGeneric(ByVal pToInst As Object, ByVal pFromInst As Object, ByVal pTrans As Object, ByVal pClsName As String, ByVal strFolder As String)
+		If pFromInst.Folders(strFolder).Count > 0 Then
+			Dim objInstance
+			'Copy all the instances
+			For Each objInstance In pFromInst.Folders(strFolder).Scan("", pClsName)
+				objInstance.Members(pClsName).Value = pToInst
+				
+				If strFolder = "TaskActivities" Then
+					'unlink Hospital
+					If pFromInst.IsKindOf("Hospital") And Not IsNullNothing(objInstance.Members("Hospital")) Then _
+					CType(objInstance.Members("Hospital"), JoinMember).Value = Nothing
+				ElseIf strFolder = "SASalesOrganizations" Then
+					'unlink GPO
+					If pFromInst.IsKindOf("GPO") And Not IsNullNothing(objInstance.Members("GPO")) Then _
+					CType(objInstance.Members("GPO"), JoinMember).Value = Nothing
+				End If
+				objInstance.Save(pTrans)
+			Next
+		End If
+	End Sub
+
+	Shared Private Sub SubMergeContract(ByVal pToInst As Object, ByVal pFromInst As Object, ByVal pTrans As Object, ByVal pClsName As String, ByVal strFolder As String)
+		'Check if the fromInst or to Instance is a Payer
+		If pFromInst.IsKindOf("MM_Payer") Then
+		'skip it - dont recreate
+		ElseIf pToInst.IsKindOf("MM_payer") Then
+		'skip it - dont recreate
+		Else
+		'use the generic merging of contract
+			SubMergeGeneric(pToInst, pFromInst, pTrans, "Organization", "Contracts") 'MM_ContractHeader - Dev. 2904
+		End If
+	End Sub
+
+	Shared Private Sub MergeSingleSalesObjective(ByVal pToInst As Object, ByVal pFromInst As Object, ByVal pTrans As Object, ByVal pClsName As String, ByVal strFolder As String)
+
+		If pFromInst.Folders(strFolder).Count > 0 Then
+			Dim objInstance
+			Dim oSglSales
+			'Copy all the instances
+			For Each objInstance In pFromInst.Folders(strFolder).Scan("", pClsName)
+				'create new one 
+				oSglSales = Nothing
+				oSglSales = pToInst.Folders(strFolder).CreateNewInstance
+				If Not oSglSales Is Nothing Then
+					'JSP 20100914 done in model
+					'oSglSales.Assignee.value = pToInst
+					
+					If Not IsNullNothing(objInstance.Members("HomeOffice").value)  Then _
+						oSglSales.Members("HomeOffice").value = objInstance.Members("HomeOffice").value
+					
+					If Not objInstance.Members("Product") Then _
+						oSglSales.Members("Product").value = objInstance.Members("Product").value
+					
+					If Not IsNullNothing(objInstance.Members("Team")) Then _
+						oSglSales.Members("Team").value = objInstance.Members("Team").value
+					
+					If Not IsNullNothing(objInstance.Members("Territory")) Then _
+						oSglSales.Members("Territory").value = objInstance.Members("Territory").value
+					
+					If Not objInstance.Members("Title").value  Then _
+						oSglSales.Members("Title").value = objInstance.Members("Title").value
+					
+					If Not IsNullNothing(objInstance.Members("Validity")) Then
+						If Not IsNullNothing(objInstance.Members("Validity").Value.Members("start"))  Then _
+							oSglSales.Members("Validity").Value.Members("start").value = objInstance.Members("Validity").Value.Members("start").value
+						If Not IsNullNothing(objInstance.Members("Validity").Value.Members("finish")) Then _
+							oSglSales.Members("Validity").Value.Members("finish").value = objInstance.Members("Validity").Value.Members("finish").value
+						'oNewKeyAccountPlan.Validity.copy(objKeyAccountPlan.Validity.value)
+					End If
+					If Not IsNullNothing(objInstance.Members("PP_SWOT")) Then
+						CType(oSglSales.Members("PP_SWOT"), ClassMember).Value.Copy(CType(objInstance.Members("PP_SWOT"), ClassMember).Value)
+					End If
+					
+					'parent plan
+					If Not objInstance.Members("ParentPlan") Then _
+						oSglSales.Members("ParentPlan").value = objInstance.Members("ParentPlan").value
+					oSglSales.Save(pTrans)
+				End If	
+				'sub-folders
+				'there should be no more SingleSalesObjectives
+				'MergeSingleSalesObjective(oNewKeyAccountPlan, objKeyAccountPlan, pTrans, "PP_KEYACCOUNTPLAN", "PP_SingleSalesObjectives", pToInst) 'PP_SingleSalesObjective
+				SubMergeGeneric(oSglSales, objInstance, pTrans, "PP_PLAN", "PP_Activities") 'PP_Activity
+				SubMergeGeneric(oSglSales, objInstance, pTrans, "PP_PLAN", "PP_Competitors") 'PP_Competitor
+				SubMergeGeneric(oSglSales, objInstance, pTrans, "PP_PLAN", "PP_Influencers") 'PP_Influencer
+				SubMergeGeneric(oSglSales, objInstance, pTrans, "PP_PLAN", "PP_PlanAttachments") 'PP_PlanAttachment
+				SubMergeGeneric(oSglSales, objInstance, pTrans, "PP_PLAN", "PP_PlanReviews") 'PP_PlanReview
+				SubMergeGeneric(oSglSales, objInstance, pTrans, "PP_KEYACCOUNTPLAN", "PP_Applies") 'PP_Apply
+				SubMergeGeneric(oSglSales, objInstance, pTrans, "ParentPlan", "PP_KeyAccountPlans") 'PP_KeyAccountPlan 
+			Next
+		End If
+	End Sub
+
+	Shared Private Sub MergeKeyAccountPlanChildren(ByVal pNewKeyAccountPlan As Object, ByVal pobjKeyAccountPlan As Object, ByVal pTrans As Object, ByVal pClsName As String, ByVal strFolder As String, ByVal pToOrgInst As Object, ByVal strClassToCreate As String)
+		Dim strIntoClass As String : strIntoClass = ""
+		Dim strClsName2 As String : strClsName2 = ""
+		Dim strTLF As String : strTLF = ""
+
+		If pobjKeyAccountPlan.Folders(strFolder).Count > 0 Then
+			Dim objInstance
+		'Dim oKeyAccount
+		'Copy all the instances
+			For Each objInstance In pobjKeyAccountPlan.Folders(strFolder).Scan("", pClsName, , "RecordStamp.WhenAdd ASC")
+		'reKey the Parent Plan/ was blank off due to deletion of then Main KeyAccountPlan
+		'If Not objInstance.ParentPlan.isnull Then
+		'should take the new KeyAccountPlan 
+				If Not pNewKeyAccountPlan Is Nothing Then _
+				objInstance.ParentPlan.value = pNewKeyAccountPlan
+				objInstance.Save(pTrans)
+				'check for 2nd level - need to iterate just to save to know it was already processed
+				If objInstance.Folders(strFolder).Count > 0 Then
+					Call MergeKeyAccountPlanChildren_Succeeding(objInstance, pTrans, pClsName, strFolder)
+				End If
+			Next
+		End If
+	End Sub
+
+	Shared Private Sub MergeKeyAccountPlanChildren_Succeeding(ByVal pobjKeyAccountPlan As Object, ByVal pTrans As Object, ByVal pClsName As String, ByVal strFolder As String)
+
+		Dim strIntoClass As String : strIntoClass = ""
+		Dim strClsName2 As String : strClsName2 = ""
+		Dim strTLF As String : strTLF = ""
+
+		'Create a property "KAP Processed" -  as indicator that it was processed
+		pobjKeyAccountPlan.Properties("KAP Processed").Value = True
+
+		'iterate through itself
+		If pobjKeyAccountPlan.Folders(strFolder).Count > 0 Then
+			Dim objInstance
+			
+			For Each objInstance In pobjKeyAccountPlan.Folders(strFolder).Scan("", pClsName, , "RecordStamp.WhenAdd ASC")
+				Call MergeKeyAccountPlanChildren_Succeeding(objInstance, pTrans, pClsName, strFolder)
+			Next
+		End If
+
+	End Sub
+
+	Shared Private Sub MergePP_Apply(ByVal pToInst As Object, ByVal pFromInst As Object, ByVal pTrans As Object, ByVal pClsName As String, ByVal strFolder As String)
+
+		If pFromInst.Folders(strFolder).Count > 0 Then
+			Dim objInstance
+			Dim oPPApply
+		'Copy all the instances
+			For Each objInstance In pFromInst.Folders(strFolder).Scan("", pClsName)
+		'create new one 
+				oPPApply = Nothing
+				oPPApply = pToInst.Folders(strFolder).CreateNewInstance
+				If Not oPPApply Is Nothing Then
+					If Not objInstance.Members("AppliesOrgTarget") Then _
+					oPPApply.AppliesOrgTarget.value = objInstance.AppliesOrgTarget.value
+					
+					oPPApply.Save(pTrans)
+				End If
+			Next
+		End If
+	End Sub
+
+
+	Shared Private Sub MergePA_OrgTarget(ByVal pToInst As Object, ByVal pFromInst As Object, ByVal pTrans As Object, ByVal pClsName As String)
+		LogMessage("MergePA_OrgTarget function start")
+		If pFromInst.Folders("PA_OrgTargetWithoutFilter").count > 0 Then
+			Dim objPa_Target
+			Dim objPA_TargetTo
+			For Each objPa_Target In pFromInst.Folders("PA_OrgTargetWithoutFilter").Scan("","Plan")
+				If objPa_Target.Members("Plan") IsNot Nothing Then
+					'If Not IsNullNothing(objPa_Target.Plan) Then
+						If Not pToInst.Folders("PA_OrgTargetWithoutFilter").ExistsWhere("Plan = '" & objPa_Target.Members("Plan").Value.Key.ToString() & "'") Then
+							objPa_Target.Members(pClsName).Value = pToInst
+							objPa_Target.Save(pTrans)
+						Else
+							'compare whose TargetCalls got more
+							objPA_TargetTo = Nothing
+							objPA_TargetTo = pToInst.Folders("PA_OrgTargetWithoutFilter").Scan("Plan = '" & objPa_Target.Members("Plan").Value.Key.ToString() & "'", "Plan").Fetch
+							If Not IsNullNothing(objPA_TargetTo) Then
+								If objPa_Target.Members("TargetCalls").value > objPA_TargetTo.Members("TargetCalls").value Then
+									'use the From instance and copy all
+									objPA_TargetTo.Members("TargetCalls").value = objPa_Target.Members("TargetCalls").value
+									objPA_TargetTo.Members("ActualCalls").value = objPa_Target.Members("ActualCalls").value
+									CType(objPA_TargetTo.Members("LastCall"), ClassMember).Value.Copy(CType(objPa_Target.Members("LastCall"), ClassMember).Value)
+									objPA_TargetTo.Members("POAPresentation").Value = objPa_Target.Members("POAPresentation").Value
+									objPA_TargetTo.Members("POAProduct").value = objPa_Target.Members("POAProduct").value
+									objPA_TargetTo.Members("PrimaryPresentation").value = objPa_Target.Members("PrimaryPresentation").value
+									objPA_TargetTo.Members("Territory").value = objPa_Target.Members("Territory").value
+									objPA_TargetTo.Members("TertiaryPresentation").value = objPa_Target.Members("TertiaryPresentation").value
+									objPA_TargetTo.Save(pTrans)
+								End If
+								If objPa_Target.CanDelete And objPa_Target.DeleteStatus = 0 Then
+									objPa_Target.Delete(pTrans)
+								End If	
+							End If
+						End If
+					'End If
+				End If
+			Next
+		End If
+		LogMessage("MergePA_OrgTarget function finished")
+	End Sub
+
+	Shared Private Function GetGUID(ByVal strGUID) As String
+		If InStr(strGUID, "{") > 0 Then
+			strGUID = Replace(strGUID, "{", "")
+		End If
+
+		If InStr(strGUID, "}") > 0 Then
+			strGUID = Replace(strGUID, "}", "")
+		End If
+
+		GetGUID = strGUID
+	End Function
+	
+	Shared Private Function ParseForSQL(ByVal tStrValue)
+		If tStrValue = "" Then
+			ParseForSQL = ""
+			Exit Function
+		End If
+		ParseForSQL = Replace(tStrValue, "'", "''")
+	End Function
+	
+	Shared Private Sub MergePrescriberSales(ByVal pToInst As Object, ByVal pFromInst As Object ,ByVal pTrans As Object)
+		'Dev#4393 APN 3/30/2012 Will choose to always rekey org on these sales otherwise the sale gets deleted since org has delete children behavior
+		'GPO/MCO - gets nulled out.
+		LogMessage("MergePrescriberSales function start")
+		Dim objSale
+
+		For Each objSale In sys.Folders("SAPrescriberSales").Scan("Organization.key = '" & pFromInst.Key.ToString() & "'")
+			objSale.Members("Organization").Value = pToInst
+			objSale.Save(pTrans)
+		Next
+
+		For Each objSale In sys.Folders("SAPrescriberSales").Scan("MCO.key = '" & pFromInst.Key.ToString() & "'")
+			CType(objSale.Members("MCO"), JoinMember).Value = Nothing
+			objSale.Save(pTrans)
+		Next
+
+		For Each objSale In sys.Folders("SAPrescriberSales").Scan("GPO.key = '" & pFromInst.Key.ToString() & "'")
+			CType(objSale.Members("GPO"), JoinMember).Value = Nothing
+			objSale.Save(pTrans)
+		Next
+		LogMessage("MergePrescriberSales function finished")
+	End Sub
+	
+	Private Shared Function IsNullNothing(member As Object)
+		Dim blnnull As Boolean
+		blnnull = False
+		Try
+			If member.Value Is Nothing Then
+				blnnull = True
+			End If
+		Catch ex As exception
+			blnnull = True
+		End Try
+		IsNullNothing = blnnull
+	End Function
+	
+	
+	Shared Private Function ConnectDB()
+		' Dim blnSuccess
+		' blnSuccess = False
+		Try
+			objDBProvider = sys.SystemConfiguration.DataProviders("Default").Provider
+			objCon = CreateObject("ADODB.Connection")
+			'set CommandTimeout to 0
+			objCon.CommandTimeout = 0
+			objCon.Open(objDBProvider.ConnectionString)
+			'objCmd.ActiveConnection = objDB	
+			ConnectDB = objCon
+			objSystemLog.InvokeMethod("LogNormalDetail", "Successfully connected to the Database.")
+			' blnSuccess = True
+		
+		Catch ex As exception
+			objSystemLog.InvokeMethod("LogErrorDetail","","","Error Connecting to the Database - " & ex.Message)
+			ConnectDB = Nothing
+		Finally
+			' ConnectDB = blnSuccess
+		End Try
+	End Function
+	
+	Shared Private Function ProcessTransaction(ByVal objTrans As Object, ByRef strErrors() As String, Optional ByVal strClassName As String = "", Optional ByVal strDescription As String = "") As Boolean
+        Dim I, intMessageCount As Integer
+        Dim strMessage As String
+        Dim objAEVAl 
+        Dim strMemberName As String
+		Dim strClsName As String
+        Try
+            'Check the transaction for Validation Errors
+            objAEVAl = objTrans.Validate
+            If objAEVAl.Status = 3 Then
+                'The object has failed validation, ALL Error Messages should be logged
+                intMessageCount = objAEVAl.Count
+                For I = 0 To intMessageCount - 1
+                    If objAEVAl.Item(I).Instance.Members("Key") Is Nothing Then
+					strMessage = objAEVAl.Item(I).Message & vbCrLf & "AEID: " 
+					Else
+					strMessage = objAEVAl.Item(I).Message & vbCrLf & "AEID: " & objAEVAl.Item(I).Instance.Key
+					End If
+                    If Not objAEVAl.Item(I).Member Is Nothing Then
+                        strMemberName = objAEVAl.Item(I).Member.Definition.Name
+                    Else
+                        strMemberName = ""
+                    End If
+					If Not objAEVAl.Item(I).Instance.Class Is Nothing Then
+                        strClsName = objAEVAl.Item(I).Instance.Class.Name
+                    Else
+                        strClsName = ""
+                    End If
+                    Redim Preserve strErrors(Ubound(strErrors) + 1)
+                    strErrors(Ubound(strErrors)) = "AEVAL: " & strMessage & "[" & strClsName & ", " & strMemberName & ", " & strDescription & "]"
+                Next
+                ProcessTransaction = False
+            Else
+                'Commit the transaction (all SQL errors will be caught by the error handler)
+                objTrans.Commit()
+                ProcessTransaction = True
+            End If
+
+
+        Catch ex As Exception
+            'Logs the Error as a Process error (not an instance error)
+            objSystemLog.InvokeMethod("LogErrorDetail","","","SYSTEM_ERROR " & ex.message)
+            ProcessTransaction = False
+        End Try
+
+    End Function
+	
+	Shared Private Function LogMessage(strlogmessage As String)
+	
+		objSystemLog.InvokeMethod("LogNormalDetail", strlogmessage)
+		
+	End Function
+	
+End Class
